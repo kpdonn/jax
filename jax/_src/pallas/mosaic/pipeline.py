@@ -500,11 +500,8 @@ class BufferedRef(BufferedRefBase):
       raise ValueError(
           f"buffer_count must be at least 1, got {self.buffer_count}"
       )
-    if self.is_output:
-      if self.is_buffered and self.buffer_count > 2:
-        raise NotImplementedError(
-            "Buffer count >2 not supported for output buffered refs."
-        )
+    # Output buffer_count > 2 is supported via past_indices tracking
+    # in the Scheduler.
 
   @property
   def spec(self):
@@ -1301,6 +1298,7 @@ class Scheduler:
             for i, j in zip(fetch_indices, grid_offsets, strict=True)
       ))
 
+
   @contextmanager
   def _named_scope(self, name):
     if self.trace_scopes:
@@ -1525,18 +1523,22 @@ class Scheduler:
       schedule = _default_schedule
     pred: Any = schedule['wait_out'](self, buffered_ref, dst_ref)
 
-    @pl.when(pred)
+    # With buffer_count=N, we can't wait until N-1 DMAs have been issued.
+    # Before that, the slot we'd wait on was never written to.
+    # Guard on actual copy_out count rather than step number, since
+    # copy_out may not fire every step (schedule predicate may skip).
+    if buffered_ref.is_output and buffered_ref.is_buffered:
+      enough_copies = buffered_ref.cumulative_copy_out >= buffered_ref.buffer_count
+      wait_pred = pred & enough_copies
+    else:
+      wait_pred = pred
+
+    @pl.when(wait_pred)
     @self._named_scope("ep_wait_out")
     def _wait():
       if buffered_ref.is_output:
-        # Note: As implemented, the current scheduler cannot support multiple
-        # buffering on outputs. In order to do so properly, we need to save
-        # the indices for which the copy_out was issued, and wait on them
-        # here. In the current schedule we always immediately wait_out
-        # on the iteration after the copy_out, so the prev_indices is always
-        # the correct grid index to wait on.
         buffered_ref.wait_out(dst_ref, self.prev_indices)
-    return buffered_ref.advance_wait_out_slot(pred & buffered_ref.is_output)
+    return buffered_ref.advance_wait_out_slot(wait_pred & buffered_ref.is_output)
 
   # --> Call "postyeet" here, after last output copy is finished from previous
   #     cycle
@@ -1572,11 +1574,24 @@ class Scheduler:
       schedule = _default_schedule
     pred: Any = schedule['epilogue_wait_out'](self, buffered_ref, dst_ref)
 
-    @pl.when(pred)
-    @self._named_scope("ep_finalize")
-    def _end():
-      if buffered_ref.is_output:
-        buffered_ref.wait_out(dst_ref, self.indices)
+    if buffered_ref.is_output and buffered_ref.is_buffered:
+      # With buffer_count=N, the loop leaves N-1 pending output DMAs.
+      # Wait for them, advancing the slot between waits so each uses
+      # the correct semaphore. The indices just need to produce valid
+      # slices — the semaphore slot handles actual synchronization.
+      with self._named_scope("ep_finalize"):
+        for i in range(buffered_ref.buffer_count - 1):  # pylint: disable=cell-var-from-loop
+          @pl.when(pred)
+          def _wait():
+            buffered_ref.wait_out(dst_ref, self.prev_indices)  # pylint: disable=cell-var-from-loop
+          if i < buffered_ref.buffer_count - 2:
+            buffered_ref = buffered_ref.advance_wait_out_slot(pred)
+    else:
+      @pl.when(pred)
+      @self._named_scope("ep_finalize")
+      def _end():
+        if buffered_ref.is_output:
+          buffered_ref.wait_out(dst_ref, self.indices)
 
     buffered_ref.save_slots()
 
